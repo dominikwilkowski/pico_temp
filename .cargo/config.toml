@@ -1,0 +1,22 @@
+# The Pico 2 W has an RP2350 chip with Arm Cortex-M33 cores
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+# picotool flashes the binary over USB while the Pico is in BOOTSEL mode
+runner = "picotool load -u -v -x -t elf"
+
+rustflags = [
+	# --nmagic turns off page alignment of sections which saves flash space
+	"-C", "link-arg=--nmagic",
+	# link.x comes from cortex-m-rt and pulls in our memory.x
+	"-C", "link-arg=-Tlink.x",
+	"-C", "target-cpu=cortex-m33",
+]
+
+[alias]
+# the tests only exercise the library half of the crate, so they run on
+# this computer instead of the Pico; plain `cargo test` fails because the
+# bare-metal target above has no test harness. On a non-Apple-Silicon
+# machine swap in the triple that `rustc -vV` reports as host
+test-host = "test --lib --target aarch64-apple-darwin"

@@ -1,0 +1,28 @@
+[package]
+name = "pico-water-temp"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+ds18b20 = "0.1"
+embedded-hal = "1.0"
+# the community 1-Wire crates used in reference_community_crates.rs are
+# built against the older embedded-hal 0.2, this rename lets both trait
+# versions live side by side in the same project
+embedded-hal-0-2 = { package = "embedded-hal", version = "0.2" }
+heapless = "0.9"
+one-wire-bus = "0.1"
+panic-halt = "1.0"
+rp235x-hal = { version = "0.4", features = ["critical-section-impl", "rt"] }
+usb-device = "0.3"
+usbd-serial = "0.2"
+
+# settings taken from the official rp235x project template
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+incremental = false
+lto = "fat"
+opt-level = 3
+overflow-checks = false

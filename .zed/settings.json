@@ -1,0 +1,20 @@
+// Project settings for the Zed editor
+{
+	"lsp": {
+		"rust-analyzer": {
+			"initialization_options": {
+				// rust-analyzer's default check command is
+				// `cargo check --all-targets`, which includes the test
+				// harness targets. Those need std and cannot build for the
+				// bare-metal Pico target that .cargo/config.toml selects,
+				// flooding the editor with errors. Checking only the default
+				// targets (the library and the firmware binary) keeps the
+				// diagnostics clean; the tests are still checked whenever
+				// `cargo test-host` runs them on this computer.
+				"check": {
+					"allTargets": false
+				}
+			}
+		}
+	}
+}
