@@ -1,1 +1,5 @@
 /target
+# holds the real WiFi password, see src/wifi_credentials.example.rs
+/src/wifi_credentials.rs
+# a built image contains that password too
+*.uf2

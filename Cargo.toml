@@ -4,20 +4,41 @@ version = "1.0.0"
 edition = "2024"
 
 [dependencies]
-ds18b20 = "0.1"
+# the traits the 1-Wire driver is written against, keeping it hardware agnostic
 embedded-hal = "1.0"
-# the community 1-Wire crates used in reference_community_crates.rs are
-# built against the older embedded-hal 0.2, this rename lets both trait
-# versions live side by side in the same project
-embedded-hal-0-2 = { package = "embedded-hal", version = "0.2" }
-heapless = "0.9"
-one-wire-bus = "0.1"
-panic-halt = "1.0"
-rp235x-hal = { version = "0.4", features = ["critical-section-impl", "rt"] }
-usb-device = "0.3"
-usbd-serial = "0.2"
 
-# settings taken from the official rp235x project template
+# Everything below only exists when building for the Pico. Keeping the
+# hardware crates out of the plain [dependencies] list is what lets
+# `cargo test-host` compile the library for this computer, where the
+# RP2350 register definitions could never build
+[target.'cfg(target_arch = "arm")'.dependencies]
+# Embassy is the async framework: embassy-rp drives the RP2350's hardware,
+# embassy-executor runs our tasks, embassy-time hands out timers, and
+# cortex-m-rt is the bare-metal runtime underneath (reset handler, linker script)
+cortex-m-rt = "0.7"
+embassy-executor = "0.10"
+# rp235xa picks the chip, time-driver backs embassy-time with the hardware
+# timer, critical-section-impl provides the lock the other crates need,
+# executor-thread brings the executor main.rs names
+embassy-rp = { version = "0.10", features = ["rp235xa", "time-driver", "critical-section-impl", "executor-thread"] }
+embassy-time = "0.5"
+
+# the WiFi chip: its driver, the firmware it needs uploaded at every boot,
+# the PIO bus the RP2350 talks to it over, and the TCP/IP stack on top
+cyw43 = "0.7"
+cyw43-firmware = { version = "0.1", features = ["wifi"] }
+cyw43-pio = "0.10"
+embassy-net = { version = "0.9", features = ["dhcpv4", "medium-ethernet", "proto-ipv4", "tcp", "udp", "dns"] }
+
+# log::info! lines travel to the computer over USB serial
+embassy-usb-logger = "0.6"
+log = "0.4"
+
+panic-halt = "1.0"
+static_cell = "2.1"
+
+# release settings borrowed from the rp-rs rp235x project template, the
+# Embassy examples only ask for debug symbols
 [profile.release]
 codegen-units = 1
 debug = 2

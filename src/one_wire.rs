@@ -208,7 +208,9 @@ where
 		self.delay.delay_us(3);
 		self.release()?;
 		// the sensor guarantees its answer is valid for 15us measured
-		// from the falling edge, so sample at roughly 12us
+		// from the falling edge, so sample at roughly 12us. The 3us of
+		// slack covers an interrupt stretching the wait a little; should
+		// one ever stretch it further, the CRC check catches the bad bit
 		self.delay.delay_us(9);
 		let bit = self.is_high()?;
 		// wait out the remainder of the 60us time slot plus recovery
@@ -280,52 +282,24 @@ where
 mod one_wire_tests {
 	use super::*;
 
-	// A fake 1-Wire bus that plays the sensor's side of the conversation.
+	// A fake sensor that plays the DS18B20's side of a conversation.
 	//
 	// The real bus is open-drain: the controller and the sensor can both
 	// pull the single line low, and a pull-up raises it when neither does.
-	// This mock captures that. When the driver releases the line, the mock
-	// answers with the next bit from a canned script, which is exactly what
-	// a real sensor drives onto the bus during a read slot
+	// This mock captures that, and it knows where in the conversation it
+	// is by counting how often the driver has released the line
+	#[derive(Default)]
 	struct MockBus {
-		// the level the sensor presents after each release of the line,
-		// consumed one per release across the whole conversation
-		responses: heapless::Deque<bool, 128>,
+		// the nine scratchpad bytes the fake sensor answers with
+		scratchpad: [u8; 9],
+		// pretend nothing is wired up, so the reset pulse gets no answer
+		sensor_missing: bool,
+		// how many times the driver has released the line so far
+		releases: usize,
 		// whether the controller is currently pulling the line low
 		controller_pulling_low: bool,
-		// the level the mock presents when the controller has released
+		// the level the sensor presents while the controller has released
 		sensor_level_high: bool,
-	}
-
-	impl MockBus {
-		// build the response script for a full read_temperature call, which
-		// mirrors the shape of the real transaction: the driver releases the
-		// line once during reset, once per bit while writing the two command
-		// bytes, and once per bit while reading the nine scratchpad bytes
-		fn for_scratchpad(scratchpad: &[u8; 9]) -> Self {
-			let mut responses = heapless::Deque::new();
-			// the presence pulse: the sensor pulls the line low after reset
-			responses.push_back(false).expect("mock response queue overflow");
-			// while the controller writes the 16 command bits the sensor
-			// leaves the line alone, so the pull-up keeps it high (the
-			// driver never samples these, the level just has to be there)
-			for _ in 0..16 {
-				responses.push_back(true).expect("mock response queue overflow");
-			}
-			// the scratchpad data, each byte least significant bit first,
-			// using the same shift-and-mask idiom explained in write_byte
-			for byte in scratchpad {
-				for bit_index in 0..8 {
-					// capacity is fixed at 128 and 1 + 16 + 72 stays under it
-					responses.push_back((byte >> bit_index) & 1 == 1).expect("mock response queue overflow");
-				}
-			}
-			Self {
-				responses,
-				controller_pulling_low: false,
-				sensor_level_high: true,
-			}
-		}
 	}
 
 	// the pin traits hang their shared error type off this supertrait,
@@ -342,11 +316,28 @@ mod one_wire_tests {
 		}
 
 		fn set_high(&mut self) -> Result<(), Self::Error> {
-			// the controller released, so the sensor decides the level: it
-			// serves the next scripted bit, defaulting high once the script
-			// is exhausted, which mimics the idle pull-up
+			// the controller let go, so the sensor decides the level. Which
+			// release this is tells the mock where in the conversation it is:
+			// the first one ends the reset pulse, and a present sensor answers
+			// by pulling the line low (its presence pulse); the next 16 happen
+			// while the driver writes the two command bytes, where the sensor
+			// stays quiet and the pull-up keeps the line high; every one after
+			// that opens a read slot, where the sensor puts the next scratchpad
+			// bit on the line, least significant bit first
 			self.controller_pulling_low = false;
-			self.sensor_level_high = self.responses.pop_front().unwrap_or(true);
+			self.sensor_level_high = match self.releases {
+				0 => self.sensor_missing,
+				1..=16 => true,
+				read_slot => {
+					let bit_number = read_slot - 17;
+					match self.scratchpad.get(bit_number / 8) {
+						Some(byte) => (byte >> (bit_number % 8)) & 1 == 1,
+						// past the last byte the pull-up keeps the line high
+						None => true,
+					}
+				},
+			};
+			self.releases += 1;
 			Ok(())
 		}
 	}
@@ -372,63 +363,108 @@ mod one_wire_tests {
 		fn delay_ns(&mut self, _nanoseconds: u32) {}
 	}
 
-	// the pure associated functions (crc8, parse_temperature) need the
-	// type named to be called, this alias keeps that short
-	type TestSensor = Ds18b20<MockBus, NoOpDelay>;
+	// crc8 and parse_temperature sit on the generic struct, so calling them
+	// means naming the type; this alias keeps that short
+	type Sensor = Ds18b20<MockBus, NoOpDelay>;
 
-	// The power-on scratchpad reads +85.0 C and carries a known-good CRC
-	// in its ninth byte, which proves our polynomial matches the part
-	const POWER_ON_SCRATCHPAD: [u8; 9] = [0x50, 0x05, 0x4B, 0x46, 0x7F, 0xFF, 0x0C, 0x10, 0x1C];
-
+	// The datasheet's power-on scratchpad is 50 05 4B 46 7F FF 0C 10 and
+	// its ninth byte, the CRC over those eight, is 1C. Reproducing it
+	// proves the polynomial matches the chip
 	#[test]
-	fn crc8_test_matches_datasheet_example() {
-		assert_eq!(TestSensor::crc8(&POWER_ON_SCRATCHPAD[..8]), POWER_ON_SCRATCHPAD[8]);
+	fn crc8_test_matches_the_datasheet_example() {
+		assert_eq!(Sensor::crc8(&[0x50, 0x05, 0x4B, 0x46, 0x7F, 0xFF, 0x0C, 0x10]), 0x1C);
 	}
 
+	// A message of only zero bits never triggers the polynomial, so the
+	// remainder stays at its starting value of zero
 	#[test]
 	fn crc8_test_of_all_zeroes_is_zero() {
-		assert_eq!(TestSensor::crc8(&[0, 0, 0, 0]), 0);
+		assert_eq!(Sensor::crc8(&[0, 0, 0, 0]), 0);
 	}
 
+	// The whole point of a checksum: the same bytes as the datasheet
+	// example, except the first one has its lowest bit flipped (0x50 ->
+	// 0x51), must not produce the original 0x1C
 	#[test]
 	fn crc8_test_detects_a_flipped_bit() {
-		let mut corrupted = POWER_ON_SCRATCHPAD;
-		corrupted[0] ^= 0b0000_0001;
-		assert_ne!(TestSensor::crc8(&corrupted[..8]), corrupted[8]);
+		assert_ne!(Sensor::crc8(&[0x51, 0x05, 0x4B, 0x46, 0x7F, 0xFF, 0x0C, 0x10]), 0x1C);
 	}
 
-	// Rows from the temperature/data relationship table in the datasheet,
-	// each the raw little-endian encoding and the celsius it represents
+	// The temperature arrives as two bytes, least significant first, that
+	// together form a count of sixteenths of a degree. 0x91 then 0x01 is
+	// 0x0191 = 401 sixteenths = 25.0625 C
 	#[test]
-	fn parse_temperature_test_matches_datasheet_table() {
-		let datasheet_rows = [
-			(0xD0, 0x07, 125.0),   // maximum reading, 0x07D0
-			(0x50, 0x05, 85.0),    // power-on value, 0x0550
-			(0x91, 0x01, 25.0625), // room temperature, 0x0191
-			(0x00, 0x00, 0.0),     // freezing point
-			(0xF8, 0xFF, -0.5),    // negative values are two's complement, 0xFFF8
-			(0x90, 0xFC, -55.0),   // minimum reading, 0xFC90
-		];
-		for (least_significant, most_significant, expected_celsius) in datasheet_rows {
-			assert_eq!(TestSensor::parse_temperature(least_significant, most_significant), expected_celsius);
-		}
+	fn parse_temperature_test_room_temperature() {
+		assert_eq!(Sensor::parse_temperature(0x91, 0x01), 25.0625);
 	}
 
-	// Higher-level flow: with the mock playing a valid scratchpad, the read
-	// path resets, clocks out all nine bytes, passes the CRC, and returns
-	// the decoded temperature
+	// 0x0550 = 1360 sixteenths = 85 C, the value a fresh sensor reports
+	// before its first conversion
+	#[test]
+	fn parse_temperature_test_power_on_value() {
+		assert_eq!(Sensor::parse_temperature(0x50, 0x05), 85.0);
+	}
+
+	// 0x07D0 = 2000 sixteenths = 125 C, the top of the sensor's range
+	#[test]
+	fn parse_temperature_test_maximum_reading() {
+		assert_eq!(Sensor::parse_temperature(0xD0, 0x07), 125.0);
+	}
+
+	// Two zero bytes are zero degrees, there is no offset to worry about
+	#[test]
+	fn parse_temperature_test_freezing_point() {
+		assert_eq!(Sensor::parse_temperature(0x00, 0x00), 0.0);
+	}
+
+	// Negative values use two's complement: 0xFFF8 read as a signed 16 bit
+	// number is -8 sixteenths, which is -0.5 C
+	#[test]
+	fn parse_temperature_test_just_below_zero() {
+		assert_eq!(Sensor::parse_temperature(0xF8, 0xFF), -0.5);
+	}
+
+	// 0xFC90 is -880 sixteenths = -55 C, the bottom of the sensor's range
+	#[test]
+	fn parse_temperature_test_minimum_reading() {
+		assert_eq!(Sensor::parse_temperature(0x90, 0xFC), -55.0);
+	}
+
+	// When nothing answers the reset pulse the driver must give up right
+	// away with NoDevicePresent instead of talking to an empty wire
+	#[test]
+	fn start_conversion_test_fails_without_a_sensor() {
+		let bus = MockBus {
+			sensor_missing: true,
+			..Default::default()
+		};
+		let mut sensor = Ds18b20::new(bus, NoOpDelay);
+		assert_eq!(sensor.start_conversion(), Err(SensorError::NoDevicePresent));
+	}
+
+	// The full read: reset, skip ROM, read scratchpad, clock in nine bytes,
+	// check the CRC, decode the temperature. The mock serves the power-on
+	// scratchpad, so the result is its 85 C
 	#[test]
 	fn read_temperature_test_decodes_a_valid_scratchpad() {
-		let mut sensor = Ds18b20::new(MockBus::for_scratchpad(&POWER_ON_SCRATCHPAD), NoOpDelay);
-		let temperature = sensor.read_temperature().expect("valid read");
-		assert_eq!(temperature, 85.0);
+		let bus = MockBus {
+			scratchpad: [0x50, 0x05, 0x4B, 0x46, 0x7F, 0xFF, 0x0C, 0x10, 0x1C],
+			..Default::default()
+		};
+		let mut sensor = Ds18b20::new(bus, NoOpDelay);
+		assert_eq!(sensor.read_temperature(), Ok(85.0));
 	}
 
+	// The same scratchpad with a wrong CRC byte (0x00 instead of 0x1C) is
+	// a corrupted reading and must come back as InvalidCrc, never as a
+	// plausible looking temperature
 	#[test]
 	fn read_temperature_test_rejects_a_bad_crc() {
-		let mut broken = POWER_ON_SCRATCHPAD;
-		broken[8] ^= 0xFF;
-		let mut sensor = Ds18b20::new(MockBus::for_scratchpad(&broken), NoOpDelay);
+		let bus = MockBus {
+			scratchpad: [0x50, 0x05, 0x4B, 0x46, 0x7F, 0xFF, 0x0C, 0x10, 0x00],
+			..Default::default()
+		};
+		let mut sensor = Ds18b20::new(bus, NoOpDelay);
 		assert_eq!(sensor.read_temperature(), Err(SensorError::InvalidCrc));
 	}
 }

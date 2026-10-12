@@ -1,5 +1,6 @@
-//! Reads a DS18B20 temperature sensor on GP22 and prints the value
-//! over USB serial roughly every two seconds
+//! Joins the WiFi network named in wifi_credentials.rs, then reads a
+//! DS18B20 temperature sensor on GP22 every two seconds and logs the
+//! value over USB serial
 //!
 //! Wiring: red -> 3V3, black -> GND, blue -> GP22, plus a 4.7k
 //! resistor between GP22 and 3V3
@@ -7,190 +8,207 @@
 #![no_std]
 #![no_main]
 
+// git ignores the real credentials file, copy wifi_credentials.example.rs
+// to wifi_credentials.rs and fill in your network
+mod wifi_credentials;
+
+// one use with braces lists every import, and `as` renames the two
+// Runner types that both crates happen to call the same thing
 use {
-	core::fmt::Write,
-	embedded_hal::delay::DelayNs,
-	heapless::String,
-	// no_std code must supply its own panic handler and panic_halt's is
-	// "stop the CPU"; `as _` imports the crate purely for that side
-	// effect without giving it a name
-	panic_halt as _,
-	pico_water_temp::one_wire::{self, Ds18b20},
-	rp235x_hal::{self as hal, Timer, gpio::InOutPin, timer::CopyableTimer0, usb::UsbBus},
-	usb_device::{
-		bus::UsbBusAllocator,
-		device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidPid},
+	cyw43::{A4, Aligned, JoinOptions, NetDriver, PowerManagementMode, Runner as RadioRunner, SpiBus},
+	cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER},
+	embassy_executor::Spawner,
+	embassy_net::{Config, Runner as NetworkRunner, StackResources},
+	embassy_rp::{
+		bind_interrupts,
+		clocks::RoscRng,
+		dma,
+		gpio::{Level, Output, OutputOpenDrain},
+		peripherals::{DMA_CH0, PIO0, USB},
+		pio::{self, Pio},
+		usb,
 	},
-	usbd_serial::SerialPort,
+	embassy_time::{Delay, Duration, Ticker, Timer},
+	// no_std code must supply its own panic handler and panic_halt's is
+	// "stop the CPU"; `as _` imports the crate purely for that side effect
+	panic_halt as _,
+	pico_water_temp::one_wire::{self, Ds18b20, SensorError},
+	static_cell::StaticCell,
 };
 
-/// Tell the RP2350 boot ROM that this flash image is a valid program
-#[unsafe(link_section = ".start_block")]
-#[used]
-pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
+// The header the RP2350 boot ROM looks for to accept this flash image as
+// a valid program is planted by embassy-rp itself, nothing to declare here
 
-/// The crystal on the Pico 2 W board runs at 12MHz
-const CRYSTAL_FREQUENCY_HZ: u32 = 12_000_000;
+// Embassy drives peripherals from interrupts instead of polling them in a
+// loop. This macro wires each hardware interrupt to the handler its
+// driver provides: the PIO and DMA ones serve the WiFi bus, the USB one
+// the logger
+bind_interrupts!(struct Irqs {
+	PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
+	DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>;
+	USBCTRL_IRQ => usb::InterruptHandler<USB>;
+});
 
-/// Pause between readings so the cycle lands at roughly two seconds
-const PAUSE_BETWEEN_READINGS_MS: u32 = 1250;
+// The WiFi chip is a small computer of its own and needs three blobs
+// uploaded at every boot. Its firmware and the CLM (the table of radio
+// channels and power levels it may legally use) ship in the
+// cyw43-firmware crate, the nvram (settings for this exact radio module)
+// lives in the firmware folder; that file is named after the Pico W's
+// RP2040 but the Pico 2 W carries the same radio module. The Aligned
+// wrapper gives the bytes the 4 byte alignment the driver insists on,
+// and the `*` copies the crate's bytes into our aligned static
+static WIFI_FIRMWARE: &Aligned<A4, [u8]> = &Aligned(*cyw43_firmware::CYW43_43439A0);
+static WIFI_NVRAM: &Aligned<A4, [u8]> = &Aligned(*include_bytes!("../firmware/nvram_rp2040.bin"));
 
-/// How many bytes one output line may grow to, see [`UsbSerial`]
-const LINE_BUFFER_BYTES: usize = 64;
+/// How often to take a reading, the sensor's conversion time is included
+const READING_INTERVAL: Duration = Duration::from_secs(2);
 
-// hal::entry marks the function the boot code jumps to after reset, and
-// the `-> !` "never" return type says this function never returns:
-// there is no operating system to hand control back to, so main ends in
-// an endless loop instead
-#[hal::entry]
-fn main() -> ! {
-	// take only fails when called twice, which a single main cannot do
-	let mut peripherals = hal::pac::Peripherals::take().expect("peripherals already taken");
+// The `main` macro turns this async function into the firmware's entry
+// point: it builds an executor, spawns main as the first task and starts
+// running tasks. There is no operating system here, the executor is all
+// the scheduling there is: an async fn can pause at every `.await` and
+// let another task run meanwhile, that is the whole trick. The two
+// arguments name embassy-rp's own executor (its executor-thread feature
+// in Cargo.toml) and cortex-m-rt's reset entry point
+#[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]
+async fn main(spawner: Spawner) {
+	// init sets up the clocks (Default::default() asks for the stock
+	// 150MHz settings) and hands back every peripheral exactly once, so
+	// the type system can prove no two parts of the program fight over one
+	let p = embassy_rp::init(Default::default());
 
-	let mut watchdog = hal::Watchdog::new(peripherals.WATCHDOG);
-	let clocks = hal::clocks::init_clocks_and_plls(
-		CRYSTAL_FREQUENCY_HZ,
-		peripherals.XOSC,
-		peripherals.CLOCKS,
-		peripherals.PLL_SYS,
-		peripherals.PLL_USB,
-		&mut peripherals.RESETS,
-		&mut watchdog,
-	)
-	// without working clocks there is nothing sensible left to do
-	.expect("clock setup failed");
+	// from here on log::info! lines show up on the computer. Tasks run
+	// side by side with main, spawning one is like starting a thread.
+	// Calling a task function does not run it, it hands back a token for
+	// spawn, or an error if the task already runs, which expect rules out
+	spawner.spawn(usb_logger_task(usb::Driver::new(p.USB, Irqs)).expect("spawned once"));
 
-	let sio = hal::Sio::new(peripherals.SIO);
-	let pins =
-		hal::gpio::Pins::new(peripherals.IO_BANK0, peripherals.PADS_BANK0, sio.gpio_bank0, &mut peripherals.RESETS);
+	// --- the WiFi chip ---
+	// The CYW43439 radio hangs off fixed pins on the board and speaks a
+	// non standard SPI, which a PIO state machine bit-bangs for us while
+	// DMA shovels the bytes, so the CPU is free to run our tasks. PIN_23
+	// switches the chip's power, PIN_25 is chip select, PIN_24 carries
+	// data both ways and PIN_29 the clock
+	let power = Output::new(p.PIN_23, Level::Low);
+	let chip_select = Output::new(p.PIN_25, Level::High);
+	let mut pio = Pio::new(p.PIO0, Irqs);
+	let spi = PioSpi::new(
+		&mut pio.common,
+		pio.sm0,
+		// the Pico 2 W's radio module is not reliable at the default bus
+		// speed, so it gets this slower clock
+		RM2_CLOCK_DIVIDER,
+		pio.irq0,
+		chip_select,
+		p.PIN_24,
+		p.PIN_29,
+		dma::Channel::new(p.DMA_CH0, Irqs),
+	);
 
-	// ticks at 1MHz which gives us the microsecond waits 1-Wire needs.
-	// the hal marks Timer0 as copyable, so the sensor and the USB struct
-	// below each own their own handle to the same hardware timer and we
-	// never have to thread one shared reference through everything
-	let timer = Timer::new_timer0(peripherals.TIMER0, &mut peripherals.RESETS, &clocks);
+	// the driver keeps its state in a static so the background task can
+	// borrow it for the whole life of the program; StaticCell is how a
+	// static gets initialized at runtime exactly once
+	static RADIO_STATE: StaticCell<cyw43::State> = StaticCell::new();
+	let (net_device, mut control, radio_runner) =
+		cyw43::new(RADIO_STATE.init(cyw43::State::new()), power, spi, WIFI_FIRMWARE, WIFI_NVRAM).await;
+	// the runner is the driver's own event loop, it lives in its own task
+	spawner.spawn(radio_task(radio_runner).expect("spawned once"));
+	// the CLM goes up separately, once the chip has booted its firmware
+	control.init(cyw43_firmware::CYW43_43439A0_CLM).await;
+	// let the radio doze between router beacons: a lot less power for a
+	// little latency on traffic arriving at the Pico
+	control.set_power_management(PowerManagementMode::PowerSave).await;
 
-	// InOutPin emulates the open-drain behavior 1-Wire expects, and the
-	// internal pull-up backs up the external 4.7k resistor
-	let mut sensor = Ds18b20::new(InOutPin::new(pins.gpio22.into_pull_up_input()), timer);
+	// --- the network stack ---
+	// embassy-net speaks TCP/IP on top of the raw packets the radio moves.
+	// DHCP asks the router for an address, the random seed makes port
+	// numbers unpredictable, and the resources hold room for four sockets:
+	// DHCP and DNS take one each, two are spare for whatever comes next
+	static NETWORK_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+	let (stack, network_runner) = embassy_net::new(
+		net_device,
+		Config::dhcpv4(Default::default()),
+		NETWORK_RESOURCES.init(StackResources::new()),
+		RoscRng.next_u64(),
+	);
+	spawner.spawn(network_task(network_runner).expect("spawned once"));
 
-	// the allocator owns the USB hardware, it has to outlive the device
-	// and class handles that UsbSerial borrows from it, so it lives here
-	let usb_allocator = UsbBusAllocator::new(UsbBus::new(
-		peripherals.USB,
-		peripherals.USB_DPRAM,
-		clocks.usb_clock,
-		true,
-		&mut peripherals.RESETS,
-	));
-	let mut usb = UsbSerial::new(&usb_allocator, timer);
-
+	// --- joining the network ---
+	// the driver wants the password as raw bytes; these defaults join WPA2
+	// or WPA3 networks on the 2.4GHz band, the only band the radio has
 	loop {
-		// gives the host time to enumerate after boot and paces the loop
-		usb.keep_alive_for(PAUSE_BETWEEN_READINGS_MS);
-
-		// and_then runs the read only when starting the conversion worked,
-		// otherwise it passes the error straight through. The `|()| {...}`
-		// is a closure, an inline function; its odd-looking `()` parameter
-		// is the empty success value start_conversion returned
-		let measurement = sensor.start_conversion().and_then(|()| {
-			// the sensor needs the full conversion time before the result is valid
-			usb.keep_alive_for(one_wire::CONVERSION_TIME_MS);
-			sensor.read_temperature()
-		});
-
-		// format_args! bundles the format string and its arguments up
-		// without building any text yet, print_line's buffer is where
-		// the actual characters materialize
-		match measurement {
-			Ok(temperature_celsius) => usb.print_line(format_args!("temperature: {temperature_celsius:.2} C\r\n")),
-			Err(sensor_error) => usb.print_line(format_args!("sensor error: {sensor_error}\r\n")),
+		match control.join(wifi_credentials::SSID, JoinOptions::new(wifi_credentials::PASSWORD.as_bytes())).await {
+			Ok(()) => break,
+			Err(error) => {
+				// `:?` prints the Debug form of the error, e.g. NetworkNotFound
+				log::warn!("joining {} failed ({error:?}), retrying", wifi_credentials::SSID);
+				Timer::after_secs(1).await;
+			},
 		}
+	}
+	// being on the network is not the same as having an address, DHCP
+	// takes a moment longer (and if this line is the last one you ever
+	// see, the router is not handing out addresses to the Pico)
+	log::info!("joined {}, waiting for an address", wifi_credentials::SSID);
+	stack.wait_config_up().await;
+	if let Some(config) = stack.config_v4() {
+		log::info!("connected as {}", config.address.address());
+	}
+	// the onboard LED is wired to the WiFi chip rather than the RP2350, so
+	// lighting it goes through the radio's control handle
+	control.gpio_set(0, true).await;
+
+	// --- the sensor ---
+	// an open-drain pin is exactly the "pull low or let go" behavior
+	// 1-Wire needs, and the internal pull-up backs up the external resistor
+	let mut sensor_bus = OutputOpenDrain::new(p.PIN_22, Level::High);
+	sensor_bus.set_pullup(true);
+	// Delay is embassy-time's blocking waiter, which gives the driver the
+	// microsecond pauses the protocol needs. Blocking stalls every other
+	// task, fine for the few milliseconds one bus transaction takes
+	let mut sensor = Ds18b20::new(sensor_bus, Delay);
+
+	// a ticker fires on a fixed schedule no matter how long the work took
+	let mut ticker = Ticker::every(READING_INTERVAL);
+	loop {
+		match measure(&mut sensor).await {
+			Ok(temperature_celsius) => log::info!("temperature: {temperature_celsius:.2} C"),
+			Err(sensor_error) => log::warn!("sensor error: {sensor_error}"),
+		}
+		// a reading that should travel somewhere would leave here, over `stack`
+		ticker.next().await;
 	}
 }
 
-/// Everything USB serial in one place: the device state machine the
-/// host talks to, the serial class that carries our bytes, a timer
-/// handle for pacing, and the buffer lines are formatted into
-///
-/// Grouping these in a struct means the main loop hands around one
-/// value instead of four, and the line buffer has a natural owner
-/// instead of floating around in main. It lives here in main.rs rather
-/// than in the library because it is welded to the RP2350's USB
-/// hardware and could never run in the host tests.
-///
-/// The `'a` is a lifetime parameter: `device` and `port` each keep a
-/// borrow of the `UsbBusAllocator` in main, and `'a` records that
-/// borrow in the type so the compiler can prove the allocator lives
-/// longer than this struct
-struct UsbSerial<'a> {
-	device: UsbDevice<'a, UsbBus>,
-	port: SerialPort<'a, UsbBus>,
-	timer: Timer<CopyableTimer0>,
-	// heapless::String keeps its bytes inline in the struct, since
-	// no_std has no allocator to grow into, and the capacity is a const
-	// generic: a number that is part of the type itself
-	line_buffer: String<LINE_BUFFER_BYTES>,
+/// One full measurement: ask for a conversion, let the sensor work, read it back
+async fn measure(sensor: &mut Ds18b20<OutputOpenDrain<'static>, Delay>) -> Result<f32, SensorError> {
+	// the `?` hands any error straight back to the caller
+	sensor.start_conversion()?;
+	// an async wait yields to the other tasks, so USB and WiFi keep being
+	// serviced while the sensor takes its 750ms; after_millis wants a u64
+	// and `.into()` widens the u32 constant for us
+	Timer::after_millis(one_wire::CONVERSION_TIME_MS.into()).await;
+	sensor.read_temperature()
 }
 
-impl<'a> UsbSerial<'a> {
-	// Every USB device announces a vendor/product ID pair so the host
-	// knows what it is talking to; this pair is set aside for hobbyist
-	// serial devices
-	const VID_PID: UsbVidPid = UsbVidPid(0x16c0, 0x27dd);
+// The three background tasks. Each is an endless loop that the executor
+// wakes whenever its hardware has something to do, which is why they
+// cost nothing while idle. The attribute turns an async fn into something
+// the executor can spawn, `-> !` says it never returns, and `'static`
+// means a task may only hold onto things that live as long as the
+// program, since nobody knows when it will next run
 
-	/// Build the serial class and the USB device announcing it, both
-	/// borrowing from the allocator in main (that is what ties the
-	/// `&'a` parameter to the `'a` on the returned struct)
-	fn new(allocator: &'a UsbBusAllocator<UsbBus>, timer: Timer<CopyableTimer0>) -> Self {
-		// the serial class has to exist before the device that announces
-		// it to the host is built
-		let port = SerialPort::new(allocator);
-		let device = UsbDeviceBuilder::new(allocator, Self::VID_PID)
-			.strings(&[StringDescriptors::default()
-				.manufacturer("workbench")
-				.product("pico water thermometer")
-				.serial_number("0001")])
-			// only fails for more descriptors than the spec allows, ours are static
-			.expect("string descriptors are valid")
-			.device_class(usbd_serial::USB_CLASS_CDC)
-			.build();
-		Self {
-			device,
-			port,
-			timer,
-			line_buffer: String::new(),
-		}
-	}
+#[embassy_executor::task]
+async fn radio_task(runner: RadioRunner<'static, SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>>) -> ! {
+	runner.run().await
+}
 
-	/// Wait the given time while keeping the USB connection serviced
-	///
-	/// The host expects the device to answer polls within a few
-	/// milliseconds, so one long sleep would get us disconnected
-	fn keep_alive_for(&mut self, milliseconds: u32) {
-		for _ in 0..milliseconds {
-			if self.device.poll(&mut [&mut self.port]) {
-				// discard anything the host sent so its buffer never fills
-				// up, into a scratch array that only needs to be roughly
-				// one USB packet in size
-				let mut incoming = [0u8; 64];
-				let _ = self.port.read(&mut incoming);
-			}
-			self.timer.delay_ms(1);
-		}
-	}
+#[embassy_executor::task]
+async fn network_task(mut runner: NetworkRunner<'static, NetDriver<'static>>) -> ! {
+	runner.run().await
+}
 
-	/// Format one line into the owned buffer and send it to the host
-	///
-	/// `Arguments` is the bundled-but-not-yet-formatted value that
-	/// `format_args!` in the main loop produces, and the `'_` lets the
-	/// compiler infer how long its borrowed pieces live
-	fn print_line(&mut self, message: core::fmt::Arguments<'_>) {
-		self.line_buffer.clear();
-		// formatting only fails if the line outgrows the 64 byte buffer,
-		// which these short messages never do
-		let _ = self.line_buffer.write_fmt(message);
-		// nobody listening on the USB side is fine, the line is just dropped
-		let _ = self.port.write(self.line_buffer.as_bytes());
-	}
+#[embassy_executor::task]
+async fn usb_logger_task(driver: usb::Driver<'static, USB>) {
+	embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
 }
